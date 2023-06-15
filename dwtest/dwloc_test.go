@@ -33,7 +33,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -96,13 +98,17 @@ func buildHarness(t *testing.T, dir string) string {
 // 'exePath' for function 'fcn' and returns the results. Stderr from
 // the harness is printed to test stderr. Note: to debug the harness,
 // try adding "-v=2" to the exec.Command below.
-func runHarness(t *testing.T, harnessPath string, exePath string, fcn string) string {
-	cmd := exec.Command(harnessPath, "-m", exePath, "-f", fcn)
+func runHarness(t *testing.T, harnessPath string, exePath string, fcn string, vars string) string {
+	args := []string{"-m", exePath, "-f", fcn}
+	if vars != "" {
+		args = append(args, "-vars", vars)
+	}
+	cmd := exec.Command(harnessPath, args...)
 	var b bytes.Buffer
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = &b
 	if err := cmd.Run(); err != nil {
-		t.Fatalf("running 'harness -m %s -f %s': %v", exePath, fcn, err)
+		t.Fatalf("running harness with args %v: %v", args, err)
 	}
 	return strings.TrimSpace(string(b.Bytes()))
 }
@@ -169,10 +175,29 @@ func (db *DB) Issue46845(ctx context.Context, dc *driverConn, release func(error
 	return nil, nil
 }
 
+var global1, global2 int
+
+//go:noinline
+func Issue60493(arg int) {
+	// localVar's loclist erroneously extends to the end of foo's code -
+	// including the epilogue.
+	var localVar int
+	localVar = global1
+
+	// Make sure the function has stack growth code generated.
+	var xx [][5000]byte
+	var x1 [5000]byte
+	xx = append(xx, x1)
+
+	global2 = localVar
+	global1 = arg
+}
+
 func main() {
 	Issue47354("poo")
 	var d DB
 	d.Issue46845(context.Background(), nil, func(error) {}, "foo", nil)
+	Issue60493(42)
 }
 
 `
@@ -183,7 +208,7 @@ func testIssue47354(t *testing.T, harnessPath string, ppath string) {
 		"arm64": "1: in-param \"s\" loc=\"{ [0: S=8 R0] [1: S=8 R1] }\"",
 	}
 	fname := "Issue47354"
-	got := runHarness(t, harnessPath, ppath, "main."+fname)
+	got := runHarness(t, harnessPath, ppath, "main."+fname, "")
 	want := expected[runtime.GOARCH]
 	if got != want {
 		t.Errorf("failed Issue47354 arch %s:\ngot: %q\nwant: %q",
@@ -219,11 +244,73 @@ func testIssue46845(t *testing.T, harnessPath string, ppath string) {
 `,
 	}
 	fname := "(*DB).Issue46845"
-	got := runHarness(t, harnessPath, ppath, "main."+fname)
+	got := runHarness(t, harnessPath, ppath, "main."+fname, "")
 	want := strings.TrimSpace(expected[runtime.GOARCH])
 	if got != want {
 		t.Errorf("failed Issue47354 arch %s:\ngot: %s\nwant: %s",
 			runtime.GOARCH, got, want)
+	}
+}
+
+func testIssue60493(t *testing.T, harnessPath string, ppath string) {
+	if runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" {
+		t.Skipf("issue 60493 has only been addressed on amd64 and arm64")
+	}
+	testenv.NeedsGo1Point(t, 22)
+	fname := "Issue60493"
+	got := runHarness(t, harnessPath, ppath, "main."+fname, "arg,localVar")
+
+	// The output should look something like this:
+	//
+	//var arg: #ranges: 4 extends to function end: true
+	//var localVar: #ranges: 2 extends to function end: false
+
+	// We parse the output and assert only a minimum expectation on the number of
+	// ranges, in order to not make the test overly sensitive to compiler changes.
+	lines := strings.Split(got, "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 lines, got:\n%s", got)
+	}
+	exp := []struct {
+		minRanges    int
+		extendsToEnd bool
+	}{
+		{
+			// arg is accessible up until the end of the function, but the function's
+			// stack growth trailed is covered by dedicated location lists, so we
+			// expect a significant number of lists.
+			minRanges:    3,
+			extendsToEnd: true,
+		},
+		{
+			// localVar is not accessible in the stack growth code at the end of the
+			// function.
+			minRanges:    1,
+			extendsToEnd: false,
+		},
+	}
+	for i := 0; i < 2; i++ {
+		r := regexp.MustCompile(`^var (.*): #ranges: (\d*), extends to function end: (.*)$`)
+		m := r.FindStringSubmatch(lines[i])
+		if m == nil {
+			t.Fatalf("unexpected output: %s", lines[i])
+		}
+		varName := m[1]
+		numRanges, err := strconv.Atoi(m[2])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if numRanges < exp[i].minRanges {
+			t.Errorf("%s: expected more than %d location ranges, got: %d", varName, exp[i].minRanges, numRanges)
+		}
+
+		extendsToEnd, err := strconv.ParseBool(m[3])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if extendsToEnd != exp[i].extendsToEnd {
+			t.Errorf("%s: expected extends to end: %t, got: %t", varName, exp[i].extendsToEnd, extendsToEnd)
+		}
 	}
 }
 
@@ -238,6 +325,8 @@ func TestDwarfVariableLocations(t *testing.T) {
 	//   it is included for the moment
 	// - the harness code currently only supports amd64 + arm64. If more
 	//   archs are added (ex: 386) the harness will need to be updated.
+	// - the test for issue 60493 only passes on amd64 and arm64, as
+	//   the respective issue was only addressed on these architectures.
 	pair := runtime.GOOS + "/" + runtime.GOARCH
 	switch pair {
 	case "linux/amd64", "linux/arm64", "windows/amd64",
@@ -272,5 +361,9 @@ func TestDwarfVariableLocations(t *testing.T) {
 	t.Run("Issue46845", func(t *testing.T) {
 		t.Parallel()
 		testIssue46845(t, harnessPath, ppath)
+	})
+	t.Run("Issue60493", func(t *testing.T) {
+		t.Parallel()
+		testIssue60493(t, harnessPath, ppath)
 	})
 }

@@ -25,6 +25,8 @@ package main
 // output for location expressions are architecture-dependent.  The
 // dumper tool currently supports two archs: amd64 and arm64.
 //
+// dwdumploc can also be used to print information on a list of variables
+// specified if the --vars flag is used.
 
 import (
 	"debug/dwarf"
@@ -46,6 +48,8 @@ import (
 var verbflag = flag.Int("v", 0, "Verbose trace output level")
 var fcnflag = flag.String("f", "", "name of function to display")
 var moduleflag = flag.String("m", "", "load module to read")
+var varsflag = flag.String("vars", "",
+	"Comma-separated list variables to inspect. If not set, info of function params is printed out.")
 
 func verb(vlevel int, s string, a ...interface{}) {
 	if *verbflag >= vlevel {
@@ -452,9 +456,70 @@ func processParams(executable string, fi *finfo) error {
 
 }
 
+// varInfo represents information on a variable's debug information.
+type varInfo struct {
+	// numLocationRanges represents the number of location ranges for which the
+	// variable has distinct location instructions.
+	numLocationRanges int
+	// extendsToFuncEnd is set if the variable is defined up until its function's
+	// last instruction (highPC).
+	extendsToFuncEnd bool
+}
+
+// getVarInfo returns information on variables with the given names (including
+// function arguments) with the given name within the given binary and function.
+// Only function arguments and variables in defined in the function's top-level
+// scope are considered.
+func getVarInfo(executable string, fi *finfo, vars []string) ([]varInfo, error) {
+	bi := proc.NewBinaryInfo(runtime.GOOS, runtime.GOARCH)
+	if err := bi.LoadBinaryInfo(executable, 0, []string{}); err != nil {
+		return nil, err
+	}
+
+	out := make([]varInfo, len(vars))
+	// Walk subprogram DIE's children.
+	pidx := fi.dwx.IdxFromOffset(fi.dwOffset)
+	childDies := fi.dwx.Children(pidx)
+	for _, e := range childDies {
+		if e.Tag != dwarf.TagFormalParameter && e.Tag != dwarf.TagVariable {
+			continue
+		}
+		if e.Val(dwarf.AttrName) == nil {
+			continue
+		}
+		idx := -1
+		for i, v := range vars {
+			if v == e.Val(dwarf.AttrName).(string) {
+				idx = i
+				break
+			}
+		}
+		if idx == -1 {
+			continue
+		}
+
+		covers, err := bi.LocationCovers(e, dwarf.AttrLocation)
+		if err != nil {
+			return nil, err
+		}
+		lastRange := covers[len(covers)-1]
+		out[idx] = varInfo{
+			numLocationRanges: len(covers),
+			extendsToFuncEnd:  lastRange[1] == fi.dwHiPC,
+		}
+	}
+	for i, v := range vars {
+		if out[i] == (varInfo{}) {
+			return nil, fmt.Errorf("variable %s not found", v)
+		}
+	}
+
+	return out, nil
+}
+
 // examineFile kicks off the search for DWARF info for 'fcn' within
 // Go binary 'executable', printing results to stdout if possible.
-func examineFile(executable string, fcn string) {
+func examineFile(executable string, fcn string, vars []string) {
 	verb(1, "examineFile(%s,%s)", executable, fcn)
 	fi, err := locateFuncDetails(executable, fcn)
 	if err != nil {
@@ -464,8 +529,19 @@ func examineFile(executable string, fcn string) {
 		log.Fatalf("could not locate target function %s in executable %s", fcn, executable)
 
 	}
-	if err := processParams(executable, &fi); err != nil {
-		log.Fatalf("error: %v\n", err)
+	if len(vars) == 0 {
+		if err := processParams(executable, &fi); err != nil {
+			log.Fatalf("error: %v\n", err)
+		}
+	} else {
+		varInfos, err := getVarInfo(executable, &fi, vars)
+		if err != nil {
+			log.Fatalf("error: %v\n", err)
+		}
+		for i, vi := range varInfos {
+			fmt.Printf("var %s: #ranges: %d, extends to function end: %t\n",
+				vars[i], vi.numLocationRanges, vi.extendsToFuncEnd)
+		}
 	}
 }
 
@@ -480,6 +556,10 @@ func main() {
 	if flag.NArg() != 0 {
 		usage("unexpected additional arguments")
 	}
-	examineFile(*moduleflag, *fcnflag)
+	var vars []string
+	if *varsflag != "" {
+		vars = strings.Split(*varsflag, ",")
+	}
+	examineFile(*moduleflag, *fcnflag, vars)
 	verb(1, "leaving main")
 }
